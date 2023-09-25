@@ -42,12 +42,17 @@ Example demonstrates how to run script with a specified list of users contained 
 - Allow the script to install the AzureAD module when prompted if it is not already installed.
 - Uncomment the last section of the script to receive a prompt to open the output files immediately after the script execution.
 
+.ToDo
+- Cross-Tenant execution. Make a Report from a different TenantB while signing with TenantA user (assuming priviliges). A B2B scenario.
+
 #>
 
 Param
 (
  [Parameter(Mandatory = $false)]
-    [string]$UserNamesFile
+    [string]$UserNamesFile,
+ [Parameter(Mandatory = $false)]
+    [string]$TenantId  # New parameter for specifying Tenant
 )
 
 
@@ -70,6 +75,52 @@ Function Validate-AzureADModule {
     }
 }
 
+Function NOTValidate-GlobalAdminOrReader {
+    param (
+        [string]$UserPrincipalName,  # Accept UserPrincipalName as a parameter
+        [string]$TenantId = $null    # Accept TenantId as an optional parameter, default to $null
+    )
+    
+    try {
+        $userId = (Get-AzureADUser -ObjectId $UserPrincipalName).ObjectId
+        if ($TenantId) {
+            $globalAdminRoleId = (Get-AzureADDirectoryRole -Filter "DisplayName eq 'Global Administrator'" -TenantId $TenantId).ObjectId
+            $globalReaderRoleId = (Get-AzureADDirectoryRole -Filter "DisplayName eq 'Global Reader'" -TenantId $TenantId).ObjectId
+        } else {
+            $globalAdminRoleId = (Get-AzureADDirectoryRole -Filter "DisplayName eq 'Global Administrator'").ObjectId
+            $globalReaderRoleId = (Get-AzureADDirectoryRole -Filter "DisplayName eq 'Global Reader'").ObjectId
+        }
+        
+        # Get members of both Global Admin and Global Reader roles
+        $globalAdminMembers = if ($TenantId) {
+            Get-AzureADDirectoryRoleMember -ObjectId $globalAdminRoleId -TenantId $TenantId
+        } else {
+            Get-AzureADDirectoryRoleMember -ObjectId $globalAdminRoleId
+        }
+        
+        $globalReaderMembers = if ($TenantId) {
+            Get-AzureADDirectoryRoleMember -ObjectId $globalReaderRoleId -TenantId $TenantId
+        } else {
+            Get-AzureADDirectoryRoleMember -ObjectId $globalReaderRoleId
+        }
+        
+        # Combine both lists of members
+        $allMembers = $globalAdminMembers + $globalReaderMembers
+        
+        # Check if the user is in either of the roles
+        if ($allMembers.ObjectId -contains $userId) {
+            return $true
+        } else {
+            Write-Host "User must be a Global Admin or Global Reader to run this script. Exiting..."
+            exit
+        }
+    } catch {
+        Write-Host "Error validating user role: $_"
+        exit
+    }
+}
+
+
 Function Get_UsersLicenseInfo {
   $upn = $_.UserPrincipalName
   $Country = $_.Country
@@ -84,7 +135,9 @@ Function Get_UsersLicenseInfo {
   
   foreach ($Sku in $Skus) {
       $LicenseItem = $Sku.SkuId
-      $EasyName = $global:LicenseFriendlyNames["$LicenseItem"]  # Use global variable to get friendly name
+      if ($null -ne $global:LicenseFriendlyNames) {
+                $EasyName = $global:LicenseFriendlyNames["$LicenseItem"] # Use global variable to get friendly name
+        }
       $NamePrint = if ($EasyName) { $EasyName } else { $LicenseItem }
       
       $serviceExceptDisabled = ""
@@ -121,7 +174,7 @@ Function Get_UsersLicenseInfo {
               'ProvisioningStatus'            = $ServiceStatus
           }
           $Results = New-Object PSObject -Property $Result
-          $Results | Select-Object DisplayName, UserPrinciPalName, LicensePlan, FriendlyNameofLicensePlan, ServiceId, ServiceName, ProvisioningStatus | Export-Csv -Path $ExportCSV -NoTypeInformation -Append
+          $Results | Select-Object DisplayName, UserPrinciPalName, LicensePlan, FriendlyNameofLicensePlan, ServiceId, ServiceName, ProvisioningStatus | Export-Csv -Path $ExportCSV -NoTypeInformation -Append -Encoding UTF8
       }
       
       if ($DisabledServiceCount -eq 0) {
@@ -146,79 +199,104 @@ Function Get_UsersLicenseInfo {
       'FriendlyNameOfLicensePlanAndEnabledService'= $FriendlyNameOfLicensePlanWithService
   }
   $Outputs = New-Object PSObject -Property $output
-  $Outputs | Select-Object Displayname, UserPrincipalName, Country, LicensePlanWithEnabledService, FriendlyNameOfLicensePlanAndEnabledService | Export-Csv -Path $ExportSimpleCSV -NoTypeInformation -Append
+  $Outputs | Select-Object Displayname, UserPrincipalName, Country, LicensePlanWithEnabledService, FriendlyNameOfLicensePlanAndEnabledService | Export-Csv -Path $ExportSimpleCSV -NoTypeInformation -Append -Encoding UTF8
 }
 
-
-
-# Validate local admin privileges
+ # Validate local admin privileges
 if (-not (Validate-LocalAdmin)) {
-  Write-Host "You do not have local admin privileges. Exiting..."
-  exit
-}
-
+    Write-Host "You do not have local admin privileges. Exiting..."
+    exit
+  }
+  
 # Validate and Install AzureAD module if not present
 Validate-AzureADModule
 
-# Connect to AzureAD
-Connect-AzureAD
-
-# Set output file
-$ExportCSV = ".\DetailedO365UserLicenseReport_$((Get-Date -format yyyy-MMM-dd-ddd` hh-mm` tt).ToString()).csv"
-$ExportSimpleCSV = ".\SimpleO365UserLicenseReport_$((Get-Date -format yyyy-MMM-dd-ddd` hh-mm` tt).ToString()).csv"
-
-# Get all subscribed SKUs in the tenant
-$subscribedSkus = Get-AzureADSubscribedSku
-
-# Create a hashtable to map SKU IDs to friendly names
-$LicenseFriendlyNames = @{}
-foreach ($sku in $subscribedSkus) {
-    $skuId = $sku.SkuId
-    $friendlyName = $sku.SkuPartNumber  # This is usually the friendly name of the license
-    $LicenseFriendlyNames["$skuId"] = $friendlyName
+# Connect to AzureAD with specified Tenant if provided
+if ($TenantId) {
+    try {
+        $connectedAccount = Connect-AzureAD -TenantId $TenantId
+    } catch {
+        Write-Host "Error connecting to Azure AD with TenantId $($TenantId): $_" -ForegroundColor Red
+        exit
+    }
+} else {
+    try {
+        $connectedAccount = Connect-AzureAD
+    } catch {
+        Write-Host "Error connecting to Azure AD: $_" -ForegroundColor Red
+        exit
+    }
 }
+  
+# Validate Global Admin or Global Reader. Checks if TenantId is provided, if so, passes it to the validation function, else just pass UserPrincipalName
+$UserPrincipalName = $connectedAccount.Account.Id  # Get UserPrincipalName from the connected account
 
-# FriendlyName list for license plan and service
-$FriendlyNameHash = Get-Content -Raw -Path .\LicenseFriendlyName.txt -ErrorAction Stop | ConvertFrom-StringData
-$ServiceArray = Get-Content -Path .\ServiceFriendlyName.txt -ErrorAction Stop
-
-# Hash table declaration
-$Result=""
-$Results=@()
-$output=""
-$outputs=@()
-
-# Get licensed user
-$LicensedUserCount=0
-
-# Check for input file/Get users from input file
-if([string]$UserNamesFile -ne "") {
-  # We have an input file, read it into memory
-  $UserNames=@()
-  $UserNames=Import-Csv -Header "DisplayName" $UserNamesFile
-  $userNames
-  foreach($item in $UserNames) {
-      Get-AzureADUser -ObjectId $item.displayname | Where-Object{$_.AssignedLicenses -ne $null} | ForEach-Object{
-          Get_UsersLicenseInfo
-          $LicensedUserCount++
-      }
+if ($TenantId) {
+    if (-not (Validate-GlobalAdminOrReader -UserPrincipalName $UserPrincipalName -TenantId $TenantId)) {  # Pass UserPrincipalName and TenantId to the function
+        exit
+    }
+} else {
+    if (-not (Validate-GlobalAdminOrReader -UserPrincipalName $UserPrincipalName)) {  # Pass only UserPrincipalName to the function
+        exit
+    }
+}
+  
+  # Set output file
+  $ExportCSV = ".\DetailedO365UserLicenseReport_$((Get-Date -format yyyy-MMM-dd-ddd` hh-mm` tt).ToString()).csv"
+  $ExportSimpleCSV = ".\SimpleO365UserLicenseReport_$((Get-Date -format yyyy-MMM-dd-ddd` hh-mm` tt).ToString()).csv"
+  
+  # Get all subscribed SKUs in the tenant
+  $subscribedSkus = Get-AzureADSubscribedSku
+  
+  # Create a hashtable to map SKU IDs to friendly names
+  $LicenseFriendlyNames = @{}
+  foreach ($sku in $subscribedSkus) {
+      $skuId = $sku.SkuId
+      $friendlyName = $sku.SkuPartNumber  # This is usually the friendly name of the license
+      $LicenseFriendlyNames["$skuId"] = $friendlyName
   }
-}
-# Get all licensed users
-else {
-  Get-AzureADUser -All $true | Where-Object{$_.AssignedLicenses -ne $null} | ForEach-Object{
-      Get_UsersLicenseInfo
-      $LicensedUserCount++
+  
+  # FriendlyName list for license plan and service
+  $FriendlyNameHash = Get-Content -Raw -Path .\LicenseFriendlyName.txt -ErrorAction Stop | ConvertFrom-StringData
+  $ServiceArray = Get-Content -Path .\ServiceFriendlyName.txt -ErrorAction Stop
+  
+  # Hash table declaration
+  $Result=""
+  $Results=@()
+  $output=""
+  $outputs=@()
+  
+  # Get licensed user
+  $LicensedUserCount=0
+  
+  # Check for input file/Get users from input file
+  if([string]$UserNamesFile -ne "") {
+    # We have an input file, read it into memory
+    $UserNames=@()
+    $UserNames=Import-Csv -Header "DisplayName" $UserNamesFile
+    $userNames
+    foreach($item in $UserNames) {
+        Get-AzureADUser -ObjectId $item.displayname | Where-Object{$_.AssignedLicenses -ne $null} | ForEach-Object{
+            Get_UsersLicenseInfo
+            $LicensedUserCount++
+        }
+    }
   }
-}
-
-# Open output file after execution
-Write-Host "Detailed report available in: $ExportCSV"
-Write-host "Simple report available in: $ExportSimpleCSV"
-#$Prompt = New-Object -ComObject wscript.shell
-#$UserInput = $Prompt.popup("Do you want to open output files?", 0, "Open Files", 4)
-#If ($UserInput -eq 6) {
-#  Invoke-Item "$ExportCSV"
-#  Invoke-Item "$ExportSimpleCSV"
-#}
-
+  # Get all licensed users
+  else {
+    Get-AzureADUser -All $true | Where-Object{$_.AssignedLicenses -ne $null} | ForEach-Object{
+        Get_UsersLicenseInfo
+        $LicensedUserCount++
+    }
+  }
+  
+  # Open output file after execution
+  Write-Host "Detailed report available in: $ExportCSV"
+  Write-host "Simple report available in: $ExportSimpleCSV"
+  #$Prompt = New-Object -ComObject wscript.shell
+  #$UserInput = $Prompt.popup("Do you want to open output files?", 0, "Open Files", 4)
+  #If ($UserInput -eq 6) {
+  #  Invoke-Item "$ExportCSV"
+  #  Invoke-Item "$ExportSimpleCSV"
+  #}
+  
